@@ -139,10 +139,12 @@ def get_authenticated_user_id():
 def log_tweepy_error(e, context_message=""):
     global logger
     logger.error(f"{context_message}: {e}")
+    is_auth_error = False
     if hasattr(e, 'response') and e.response is not None:
         logger.error(f"Twitter API response status: {e.response.status_code}")
         logger.error(f"Twitter API response text: {e.response.text}")
         if e.response.status_code in [401, 403]:
+            is_auth_error = True
             logger.error(
                 "A 401 (Unauthorized) or 403 (Forbidden) error occurred. "
                 "This usually means the Access Tokens used do not have 'Write' permissions. "
@@ -155,15 +157,17 @@ def log_tweepy_error(e, context_message=""):
         logger.error(f"API Errors: {e.api_errors}")
     elif hasattr(e, 'reason') and e.reason:
         logger.error(f"Reason: {e.reason}")
+    return is_auth_error
 
 def delete_likes_in_range(user_id, start_dt_utc, end_dt_utc):
     global logger
     logger.info("Starting to delete likes (based on TWEET CREATION date)...")
     deleted_count = 0
     processed_count = 0
+    auth_error_occurred = False
     if not client:
         logger.error("Client not available for deleting likes.")
-        return
+        return auth_error_occurred # Should be False, but consistent
 
     try:
         for page in tweepy.Paginator(
@@ -189,7 +193,10 @@ def delete_likes_in_range(user_id, start_dt_utc, end_dt_utc):
                             client.unlike(liked_tweet_obj.id)
                             deleted_count += 1
                         except tweepy.TweepyException as e:
-                            log_tweepy_error(e, f"Error unliking tweet {liked_tweet_obj.id}")
+                            auth_error_occurred = log_tweepy_error(e, f"Error unliking tweet {liked_tweet_obj.id}") or auth_error_occurred
+                            if auth_error_occurred: # If auth error, stop trying for this function
+                                logger.warning("Authentication error detected while unliking. Stopping like deletions.")
+                                return auth_error_occurred
                     elif tweet_created_at_utc < start_dt_utc:
                         pass 
                 else:
@@ -199,18 +206,20 @@ def delete_likes_in_range(user_id, start_dt_utc, end_dt_utc):
 
         logger.info(f"Finished deleting likes. Total unliked: {deleted_count} out of {processed_count} liked tweets considered.")
     except tweepy.TweepyException as e:
-        log_tweepy_error(e, "A TweepyException occurred in delete_likes_in_range main loop")
+        auth_error_occurred = log_tweepy_error(e, "A TweepyException occurred in delete_likes_in_range main loop") or auth_error_occurred
     except Exception as e:
         logger.error(f"An unexpected error occurred in delete_likes_in_range: {e}", exc_info=True)
+    return auth_error_occurred
 
 def delete_user_tweets_by_type(user_id, start_dt_utc, end_dt_utc, delete_replies_flag, delete_quotes_flag, delete_own_posts_flag):
     global logger
     logger.info("Starting to delete user's tweets based on selection...")
     deleted_count = 0
     processed_count = 0
+    auth_error_occurred = False
     if not client:
         logger.error("Client not available for deleting user tweets.")
-        return
+        return auth_error_occurred # Should be False
 
     try:
         for page in tweepy.Paginator(
@@ -267,15 +276,19 @@ def delete_user_tweets_by_type(user_id, start_dt_utc, end_dt_utc, delete_replies
                         deleted_count += 1
                         action_taken = True
                 except tweepy.TweepyException as e:
-                    log_tweepy_error(e, f"Error deleting tweet {tweet.id} (type attempted: reply={is_reply}, quote={is_quote}, own={not is_reply and not is_quote})")
+                    auth_error_occurred = log_tweepy_error(e, f"Error deleting tweet {tweet.id} (type attempted: reply={is_reply}, quote={is_quote}, own={not is_reply and not is_quote})") or auth_error_occurred
+                    if auth_error_occurred: # If auth error, stop trying for this function
+                        logger.warning("Authentication error detected while deleting tweets. Stopping tweet deletions.")
+                        return auth_error_occurred
             
             logger.info(f"Processed page of user tweets. Total processed so far: {processed_count}, total deleted in range: {deleted_count}")
 
         logger.info(f"Finished deleting user tweets. Total deleted: {deleted_count} out of {processed_count} tweets considered.")
     except tweepy.TweepyException as e:
-        log_tweepy_error(e, "A TweepyException occurred in delete_user_tweets_by_type main loop")
+        auth_error_occurred = log_tweepy_error(e, "A TweepyException occurred in delete_user_tweets_by_type main loop") or auth_error_occurred
     except Exception as e:
         logger.error(f"An unexpected error occurred in delete_user_tweets_by_type: {e}", exc_info=True)
+    return auth_error_occurred
 
 class TwitterDeleterApp:
     def __init__(self, root_window):
@@ -418,18 +431,35 @@ class TwitterDeleterApp:
             return
         
         logger.info(f"Operating for user ID: {user_id}")
+        auth_error_happened = False
 
         if self.delete_likes_var.get():
-            delete_likes_in_range(user_id, start_dt_utc, end_dt_utc)
+            if delete_likes_in_range(user_id, start_dt_utc, end_dt_utc):
+                auth_error_happened = True
         
-        if self.delete_replies_var.get() or self.delete_own_posts_var.get() or self.delete_quotes_var.get():
-            delete_user_tweets_by_type(user_id, start_dt_utc, end_dt_utc,
+        if not auth_error_happened and (self.delete_replies_var.get() or self.delete_own_posts_var.get() or self.delete_quotes_var.get()):
+            if delete_user_tweets_by_type(user_id, start_dt_utc, end_dt_utc,
                                        self.delete_replies_var.get(),
                                        self.delete_quotes_var.get(),
-                                       self.delete_own_posts_var.get())
+                                       self.delete_own_posts_var.get()):
+                auth_error_happened = True
+
+        if auth_error_happened:
+            detailed_error_message = (
+                "A Twitter API Authorization Error (401/403) occurred.\n\n"
+                "This usually means the Access Tokens used do not have 'Write' permissions.\n"
+                "Please check your Twitter Developer App settings:\n"
+                "1. Go to your Twitter Developer Portal.\n"
+                "2. Ensure your App's permissions are set to 'Read and Write'.\n"
+                "3. **Important**: You MUST **regenerate** your Consumer Keys and Access Token & Secret after changing permissions.\n"
+                "4. Update your .env file with these new credentials.\n\n"
+                "See the log for more detailed API responses."
+            )
+            self.root.after(0, lambda: messagebox.showerror("Twitter Authorization Error", detailed_error_message, master=self.root))
+        else:
+            logger.info("All selected deletion tasks processing initiated/completed.")
+            self.root.after(0, lambda: messagebox.showinfo("Processing Complete", "Deletion tasks have finished. Check logs for details.", master=self.root))
         
-        logger.info("All selected deletion tasks processing initiated/completed.")
-        self.root.after(0, lambda: messagebox.showinfo("Processing Complete", "Deletion tasks have finished. Check logs for details.", master=self.root))
         self.root.after(0, lambda: self.start_button.config(state=tk.NORMAL))
 
 
